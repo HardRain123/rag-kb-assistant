@@ -1,7 +1,17 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+from app.api.chat import router as chat_router
 
 app = FastAPI(title="RAG KB Assistant", version="0.1.0")
+
+app.include_router(chat_router)
+
+
+class Item(BaseModel):
+    name: str
+    description: str | None = None
+    tax: float | None = None
+    is_offer: bool | None = None
 
 
 class Message(BaseModel):
@@ -26,16 +36,14 @@ def docs():
 
 
 @app.post("/items/")
-def create_item(item: Message):
-    return {
-        "message": f"Item '{item.name}' with price {item.price} created successfully"
-    }
+def create_item(item: Item):
+    return {"message": f"Item '{item.name}' with tax {item.tax} created successfully"}
 
 
 @app.put("/items/{item_id}")
-def update_item(item_id: int, item: Message):
+def update_item(item_id: int, item: Item):
     return {
-        "message": f"Item with ID {item_id} updated to '{item.name}' with price {item.price}"
+        "message": f"Item with ID {item_id} updated to '{item.name}' with tax {item.tax}"
     }
 
 
