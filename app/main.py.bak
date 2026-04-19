@@ -1,0 +1,227 @@
+from fastapi import FastAPI, UploadFile
+from pydantic import BaseModel
+from app.api.chat import router as chat_router
+from pathlib import Path
+from fastapi import File, Form, HTTPException
+from typing import Annotated
+import uuid
+from .services.chunk_service import split_text
+
+from pypdf import PdfReader
+from chromadb import chromadb
+
+client = chromadb.Client()
+
+
+app = FastAPI(title="RAG KB Assistant", version="0.1.0")
+
+app.include_router(chat_router)
+
+
+class Item(BaseModel):
+    name: str
+    description: str | None = None
+    tax: float | None = None
+    is_offer: bool | None = None
+
+
+class Message(BaseModel):
+    name: str
+    price: float
+    is_offer: bool | None = None
+
+
+# 本地存储目录
+UPLOAD_DIR = Path("data/uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.get("/")
+def root():
+    return {"message": "RAG KB Assistant is running"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/items/")
+def create_item(item: Item):
+    return {"message": f"Item '{item.name}' with tax {item.tax} created successfully"}
+
+
+@app.put("/items/{item_id}")
+def update_item(item_id: int, item: Item):
+    return {
+        "message": f"Item with ID {item_id} updated to '{item.name}' with tax {item.tax}"
+    }
+
+
+@app.post("/chat")
+def chat(message: Message):
+    return {
+        "response": f"Received message: '{message.name}' with price {message.price}"
+    }
+
+
+@app.post("/uploadFile")
+async def upload_file(file: UploadFile):
+    content = await file.read()
+    return {"filename": file.filename, "content": content.decode("utf-8")}
+
+
+@app.post("/uploadFiles")
+async def upload_files(
+    file: Annotated[UploadFile, File(...)], kb_id: Annotated[str, Form(...)]
+):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="未选择文件")
+
+    # 生成唯一文件名，避免重名覆盖
+    task_id = str(uuid.uuid4())
+    save_name = f"{task_id}_{file.filename}"
+    save_path = UPLOAD_DIR / save_name
+
+    # 读取上传文件内容
+    content = await file.read()
+
+    # 保存到本地
+    with open(save_path, "wb") as f:
+        f.write(content)
+
+    save_to_chromadb(content.decode("utf-8"), save_path, kb_id, task_id, file.filename)
+    return {
+        "task_id": task_id,
+        "filename": file.filename,
+        "kb_id": kb_id,
+        "saved_path": str(save_path),
+    }
+
+
+# @app.post("/parsePdf")
+# async def parse_pdf(
+#     file: Annotated[UploadFile, File(...)], kb_id: Annotated[str, Form(...)]
+# ):
+#     if not file.filename:
+#         raise HTTPException(status_code=400, detail="未选择文件")
+
+#     # 生成唯一文件名，避免重名覆盖
+#     task_id = str(uuid.uuid4())
+#     save_name = f"{task_id}_{file.filename}"
+#     save_path = UPLOAD_DIR / save_name
+
+#     # 读取上传文件内容
+#     content = await file.read()
+
+#     # 保存到本地
+#     with open(save_path, "wb") as f:
+#         f.write(content)
+
+#     # 解析PDF内容
+#     try:
+#         fd = open(save_path, "rb")
+#         viewer = SimplePDFViewer(fd)
+
+#         text_content = ""
+#         for canvas in viewer:
+#             #    page_image = canvas.images
+#             # page_text = canvas.text_content
+#             page_strings = canvas.strings
+#             text_content = text_content.join(page_strings)
+#             break  # 只解析第一页，后续可以去掉这个break解析全部页
+#         print(f"解析完成，提取文本长度: {len(text_content)}")
+#         print(f"提取文本内容示例: {text_content[:500]}")  # 打印前500字符作为示例
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"PDF解析失败: {str(e)}")
+
+#     return {
+#         "task_id": task_id,
+#         "filename": file.filename,
+#         "kb_id": kb_id,
+#         "saved_path": str(save_path),
+#         "text_content": text_content,
+#     }
+
+
+@app.post("/parsePdfWithPyPDF")
+async def parse_pdf_with_pypdf(
+    file: Annotated[UploadFile, File(...)], kb_id: Annotated[str, Form(...)]
+):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="未选择文件")
+
+    # 生成唯一文件名，避免重名覆盖
+    task_id = str(uuid.uuid4())
+    save_name = f"{task_id}_{file.filename}"
+    save_path = UPLOAD_DIR / save_name
+
+    # 读取上传文件内容
+    content = await file.read()
+
+    # 保存到本地
+    with open(save_path, "wb") as f:
+        f.write(content)
+
+    # 解析PDF内容
+    try:
+        reader = PdfReader(save_path)
+        text_content = ""
+        for page in reader.pages:
+            if page.extract_text() == None:
+                continue
+            text_content += page.extract_text() + "\n"
+        print(f"解析完成，提取文本长度: {len(text_content)}")
+        print(f"提取文本内容示例: {text_content[:500]}")  # 打印前500字符作为示例
+
+        save_to_chromadb(text_content, save_path, kb_id, task_id, file.filename)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF解析失败: {str(e)}")
+
+    return {
+        "task_id": task_id,
+        "filename": file.filename,
+        "kb_id": kb_id,
+        "saved_path": str(save_path),
+        "text_content": text_content,
+    }
+
+
+def save_to_chromadb(
+    text_content: str, file_path: str, kb_id: str, doc_id: str, file_name: str
+):
+    collection = client.get_or_create_collection(name="test_collection")
+    chunks = split_text(text_content)
+    chunk_ids = [f"{doc_id}_{idx}" for idx, _ in enumerate(chunks)]
+
+    collection.add(
+        ids=chunk_ids,
+        documents=chunks,
+        metadatas=[
+            {
+                "chunk_id": chunk_ids[idx],
+                "doc_id": doc_id,
+                "kb_id": kb_id,
+                "file_name": file_name,
+                "page": 0,
+                "chunk_index": idx,
+            }
+            for idx, _ in enumerate(chunks)
+        ],
+    )
+
+    print(collection.peek())
+
+    results = collection.query(
+        query_texts=[
+            "章节名称是什么?",
+            "沈归是谁?",
+        ],
+        n_results=5,
+    )
+
+    for i, query_result in results.items():
+        print(f"\n查询结果:{i}")
+        print(query_result)
