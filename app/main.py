@@ -2,24 +2,46 @@ from pathlib import Path
 from typing import Annotated
 import uuid
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from opentelemetry import context
 from pydantic import BaseModel
 from chromadb import chromadb
+import os
+from openai import OpenAI
 
 # 导入你刚才写的切片函数
 from app.services.chunk_service import split_text
+
+load_dotenv()  # 加载 .env 文件中的环境变量
+
+MODEL_API_KEY = os.getenv("MODEL_API_KEY")
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL")
+MODEL_NAME = os.getenv("MODEL_NAME")
+
+# 初始化 OpenAI 客户端
+llm_client = OpenAI(
+    api_key=MODEL_API_KEY,
+    base_url=MODEL_BASE_URL,
+)
+
+
 
 
 # ------------------------------
 # 1. 初始化 FastAPI 应用
 # ------------------------------
-app = FastAPI(title="RAG KB Assistant", version="0.1.0")
+app = FastAPI(
+    title="RAG KB Assistant",
+    version="0.1.0",
+    description="面向理赔场景的知识库问答系统",
+)
 
 # ------------------------------
 # 2. 初始化 Chroma 客户端
 # ------------------------------
 # 这里先用最简单的本地客户端
-client = chromadb.Client()
+client = chromadb.PersistentClient(path="./data/chroma")
 
 # ------------------------------
 # 3. 本地上传目录
@@ -49,6 +71,32 @@ class AskRequest(BaseModel):
     # 检索几个 chunk，默认先取 3 个
     top_k: int = 3
 
+def built_prompt(question: str, snippets: list[str]) -> str:
+    """
+    构建给大模型的 prompt
+
+    这里先用一个简单的模板，后面你可以根据需要改得更复杂。
+    """
+
+    context = "\n\n".join(snippets)
+
+    prompt = f"""
+    你是一个理赔知识库问答助手。
+    请严格根据【上下文】回答【问题】。
+    如果上下文中找不到答案，就明确回答：未在文档中找到答案。
+    不要编造，不要补充上下文以外的信息。
+
+
+    【问题】
+    {question}
+
+    【上下文】
+    {context}
+    """.strip()
+
+
+    return prompt.strip()
+
 
 # ------------------------------
 # 5. 健康检查接口
@@ -61,6 +109,21 @@ def health():
     """
     return {"status": "ok"}
 
+
+def call_llm(prompt: str) -> str:
+    if not MODEL_API_KEY or not MODEL_BASE_URL or not MODEL_NAME:
+        raise HTTPException(status_code=500, detail="模型配置缺失，请检查 .env")
+
+    response = llm_client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "你是一个严格基于上下文回答问题的知识库助手。"},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    answer = response.choices[0].message.content
+    return answer or "模型未返回有效内容"
 
 # ------------------------------
 # 6. 上传 txt 文件接口
@@ -138,7 +201,7 @@ def ingest_txt(req: IngestRequest):
         text = f.read()
 
     # 调用切片函数
-    chunks = split_text(text, chunk_size=500, overlap=100)
+    chunks = split_text(text, chunk_size=200, overlap=50)
 
     # 如果切完没有内容，说明文件内容为空或切片失败
     if not chunks:
@@ -150,7 +213,7 @@ def ingest_txt(req: IngestRequest):
 
     # 获取或创建 collection
     # 你可以把它理解成 Chroma 里的一个“集合/表”
-    collection = client.get_or_create_collection(name="test_collection")
+    collection = client.get_or_create_collection(name="claim_kb")
 
     # 给每个 chunk 生成唯一 id
     # enumerate(chunks) 会返回：
@@ -191,19 +254,31 @@ def ingest_txt(req: IngestRequest):
 # 8. 检索接口
 # ------------------------------
 @app.get("/search")
-def search(q: str, n_results: int = 3):
-    """
-    根据问题 q 去 Chroma 里查最相关的 chunk。
-    这里先只做检索，不接大模型。
-    """
+def search(q: str, kb_id: str | None = None, n_results: int = 3):
+    collection = client.get_or_create_collection(name="claim_kb")
 
-    collection = client.get_or_create_collection(name="test_collection")
+    if kb_id:
+        results = collection.query(
+            query_texts=[q],
+            n_results=n_results,
+            where={"kb_id": kb_id},
+        )
+    else:
+        results = collection.query(
+            query_texts=[q],
+            n_results=n_results,
+        )
 
-    # query_texts 是“查询文本”
-    # Chroma 会自动把它转成向量，再去做相似搜索
-    results = collection.query(query_texts=[q], n_results=n_results)
+    documents = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+    distances = results.get("distances", [[]])[0]
 
-    return results
+    return {
+        "query": q,
+        "snippets": documents,
+        "sources": metadatas,
+        "distances": distances,
+    }
 
 
 @app.post("/ask")
@@ -219,7 +294,7 @@ def ask(req: AskRequest):
     """
 
     # 获取 collection
-    collection = client.get_or_create_collection(name="test_collection")
+    collection = client.get_or_create_collection(name="claim_kb")
 
     # 用用户问题去做相似检索
     results = collection.query(query_texts=[req.question], n_results=req.top_k)
@@ -240,9 +315,10 @@ def ask(req: AskRequest):
             "sources": [],
             "distances": [],
         }
+    
+    prompt=built_prompt(req.question, documents)
+    answer = call_llm(prompt)
 
-    # 先用假回答函数生成 answer
-    answer = build_fake_answer(req.question, documents)
 
     return {
         "question": req.question,
