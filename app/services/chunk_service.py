@@ -177,3 +177,74 @@ def merge_units(units: list[str], chunk_size: int, overlap: int) -> list[str]:
         chunks.append(current.strip())
 
     return chunks
+
+
+"""
+按标题+段落优先的方式切分文本，适合结构化文档（如说明书、报告等），能更好地保持语义完整性。
+"""
+
+
+def split_text_v2(
+    text: str, chunk_size: int = 220, overlap: int = 40, type: str = "default"
+) -> list[str]:
+    # 1. 先按标题切
+    sections = split_by_heading(text, type)
+
+    # 2. 对每个 section 再做长度兜底
+    final_chunks = []
+    for sec in sections:
+        if len(sec) <= chunk_size:
+            final_chunks.append(sec)
+        else:
+            final_chunks.extend(split_long_text(sec, chunk_size, overlap))
+
+    return final_chunks
+
+
+def is_heading(line: str, patterns: str) -> bool:
+    line = line.strip()
+    if not line:
+        return False
+
+    return any(re.match(p, line) for p in patterns)
+
+
+def split_by_heading(text: str, type: str = "default") -> list[str]:
+    lines = text.splitlines()
+    chunks = []
+    current = []
+    if type == "markdown":
+        patterns = [r"^#{1,6}\s+.*$"]  # Markdown 标题
+    else:
+        patterns = [
+            r"^第[一二三四五六七八九十百千万0-9]+[章节部分篇]\s*.*$",  # 第1章 / 第一章
+            r"^[一二三四五六七八九十]+、.+$",  # 一、二、三、
+            r"^（[一二三四五六七八九十0-9]+）.+$",  # （一）（二）（1）
+            r"^\([一二三四五六七八九十0-9]+\).+$",  # (一)(二)(1)
+            r"^[0-9]+[\.、]\s*.+$",  # 1. xxx / 1、xxx
+            r"^[0-9]+\.[0-9]+(\.[0-9]+)*\s+.+$",  # 1.1 xxx / 1.2.3 xxx
+        ]  # 常见中文文档标题格式
+
+    for line in lines:
+        if is_heading(line, patterns):
+            if current:
+                chunks.append("\n".join(current).strip())
+                current = []
+        current.append(line)
+
+    if current:
+        chunks.append("\n".join(current).strip())
+
+    return [c for c in chunks if c]
+
+
+def split_long_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = end - overlap
+    return chunks

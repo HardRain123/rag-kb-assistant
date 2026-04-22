@@ -9,9 +9,11 @@ from pydantic import BaseModel
 from chromadb import chromadb
 import os
 from openai import OpenAI
+import uvicorn
+from docx import Document
 
 # 导入你刚才写的切片函数
-from app.services.chunk_service import split_text
+from app.services.chunk_service import split_text, split_text_v2
 
 load_dotenv()  # 加载 .env 文件中的环境变量
 
@@ -24,8 +26,6 @@ llm_client = OpenAI(
     api_key=MODEL_API_KEY,
     base_url=MODEL_BASE_URL,
 )
-
-
 
 
 # ------------------------------
@@ -62,6 +62,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 class IngestRequest(BaseModel):
     saved_path: str
     kb_id: str
+    strategy: str = "a"  # 默认使用策略 a
 
 
 class AskRequest(BaseModel):
@@ -70,6 +71,7 @@ class AskRequest(BaseModel):
 
     # 检索几个 chunk，默认先取 3 个
     top_k: int = 3
+
 
 def built_prompt(question: str, snippets: list[str]) -> str:
     """
@@ -94,7 +96,6 @@ def built_prompt(question: str, snippets: list[str]) -> str:
     {context}
     """.strip()
 
-
     return prompt.strip()
 
 
@@ -117,7 +118,10 @@ def call_llm(prompt: str) -> str:
     response = llm_client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": "你是一个严格基于上下文回答问题的知识库助手。"},
+            {
+                "role": "system",
+                "content": "你是一个严格基于上下文回答问题的知识库助手。",
+            },
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
@@ -125,11 +129,12 @@ def call_llm(prompt: str) -> str:
     answer = response.choices[0].message.content
     return answer or "模型未返回有效内容"
 
+
 # ------------------------------
-# 6. 上传 txt 文件接口
+# 6. 上传文件接口
 # ------------------------------
-@app.post("/upload_txt")
-async def upload_txt(
+@app.post("/upload_file")
+async def upload_file(
     # Annotated[类型, FastAPI参数声明]
     # UploadFile 表示上传文件对象
     file: Annotated[UploadFile, File(...)],
@@ -151,8 +156,15 @@ async def upload_txt(
         raise HTTPException(status_code=400, detail="未选择文件")
 
     # 当前阶段只支持 txt
-    if not file.filename.endswith(".txt"):
-        raise HTTPException(status_code=400, detail="当前阶段只支持 txt 文件")
+    if (
+        not file.filename.endswith(".txt")
+        and not file.filename.endswith(".docx")
+        and not file.filename.endswith(".doc")
+        and not file.filename.endswith(".md")
+    ):
+        raise HTTPException(
+            status_code=400, detail="当前阶段只支持 txt、docx、doc 和 md 文件"
+        )
 
     # 生成一个唯一任务 id
     task_id = str(uuid.uuid4())
@@ -177,14 +189,40 @@ async def upload_txt(
     }
 
 
+# @app.post("/upload_docx")
+# async def upload_docx(
+#     file: Annotated[UploadFile, File(...)],
+#     kb_id: Annotated[str, Form(...)],
+# ):
+#     if not file.filename:
+#         raise HTTPException(status_code=400, detail="未选择文件")
+
+
+#     task_id = str(uuid.uuid4())
+#     save_name = f"{task_id}_{file.filename}"
+#     save_path = UPLOAD_DIR / save_name
+
+#     content = await file.read()
+
+#     with open(save_path, "wb") as f:
+#         f.write(content)
+
+#     return {
+#         "task_id": task_id,
+#         "kb_id": kb_id,
+#         "filename": file.filename,
+#         "saved_path": str(save_path),
+#     }
+
+
 # ------------------------------
-# 7. 入库接口：读取 txt -> 切片 -> 写入 Chroma
+# 7. 入库接口：读取 文件 -> 切片 -> 写入 Chroma
 # ------------------------------
-@app.post("/ingest_txt")
-def ingest_txt(req: IngestRequest):
+@app.post("/ingest_file")
+def ingest_file(req: IngestRequest):
     """
     这个接口负责：
-    1. 根据保存路径读取 txt 内容
+    1. 根据保存路径读取文件内容
     2. 调用 split_text 切片
     3. 写入 Chroma
     """
@@ -195,13 +233,13 @@ def ingest_txt(req: IngestRequest):
     if not saved_path.exists():
         raise HTTPException(status_code=404, detail="文件不存在，请先上传")
 
-    # 读取 txt 内容
-    # encoding="utf-8" 表示按 utf-8 解析文本
-    with open(saved_path, "r", encoding="utf-8") as f:
-        text = f.read()
+    text = get_file_context(saved_path)
 
     # 调用切片函数
-    chunks = split_text(text, chunk_size=200, overlap=50)
+    chunks = ingest_with_strategy(
+        text, saved_path, req.kb_id, req.strategy, collection_name="claim_kb"
+    )
+    # chunks = split_text(text, chunk_size=200, overlap=50)
 
     # 如果切完没有内容，说明文件内容为空或切片失败
     if not chunks:
@@ -213,7 +251,10 @@ def ingest_txt(req: IngestRequest):
 
     # 获取或创建 collection
     # 你可以把它理解成 Chroma 里的一个“集合/表”
-    collection = client.get_or_create_collection(name="claim_kb")
+    if req.strategy == "a":
+        collection = client.get_or_create_collection(name="claim_kb_a")
+    else:
+        collection = client.get_or_create_collection(name="claim_kb_b")
 
     # 给每个 chunk 生成唯一 id
     # enumerate(chunks) 会返回：
@@ -250,12 +291,101 @@ def ingest_txt(req: IngestRequest):
     }
 
 
+def get_file_context(saved_path):
+    if saved_path.suffix == ".docx" or saved_path.suffix == ".doc":
+        # 读取 docx 内容
+        document = Document(saved_path)
+        text = "\n".join([para.text for para in document.paragraphs])
+    else:
+        # 读取 txt 内容
+        # encoding="utf-8" 表示按 utf-8 解析文本
+        with open(saved_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    return text
+
+
+@app.post("/ingest_docx")
+def ingest_docx(req: IngestRequest):
+    saved_path = Path(req.saved_path)
+
+    if not saved_path.exists():
+        raise HTTPException(status_code=404, detail="文件不存在，请先上传")
+
+    # 读取 docx 内容
+    document = Document(saved_path)
+    text = "\n".join([para.text for para in document.paragraphs])
+
+    chunks = ingest_with_strategy(
+        text, saved_path, req.kb_id, req.strategy, collection_name="claim_kb"
+    )
+    # chunks = split_text(text, chunk_size=200, overlap=50)
+
+    if not chunks:
+        raise HTTPException(status_code=400, detail="文本为空，无法入库")
+
+    doc_id = saved_path.stem
+
+    if req.strategy == "a":
+        collection = client.get_or_create_collection(name="claim_kb_a")
+    else:
+        collection = client.get_or_create_collection(name="claim_kb_b")
+
+    chunk_ids = [f"{doc_id}_{idx}" for idx, _ in enumerate(chunks)]
+
+    metadatas = [
+        {
+            "chunk_id": chunk_ids[idx],
+            "doc_id": doc_id,
+            "kb_id": req.kb_id,
+            "file_name": saved_path.name,
+            "page": 0,
+            "chunk_index": idx,
+        }
+        for idx, _ in enumerate(chunks)
+    ]
+
+    collection.add(
+        ids=chunk_ids,
+        documents=chunks,
+        metadatas=metadatas,
+    )
+
+    return {
+        "message": "入库成功",
+        "doc_id": doc_id,
+        "chunk_count": len(chunks),
+        "sample_chunk": chunks[0][:100],
+    }
+
+
+def ingest_with_strategy(
+    text: str, saved_path: Path, kb_id: str, strategy: str, collection_name: str
+):
+    is_markdown = saved_path.suffix.lower() == ".md"
+
+    if strategy == "a":
+        chunks = split_text(text, chunk_size=300, overlap=50)
+    else:
+        chunks = split_text_v2(
+            text,
+            chunk_size=220,
+            overlap=40,
+            type="markdown" if is_markdown else "default",
+        )
+    return chunks
+
+
 # ------------------------------
 # 8. 检索接口
 # ------------------------------
 @app.get("/search")
-def search(q: str, kb_id: str | None = None, n_results: int = 3):
-    collection = client.get_or_create_collection(name="claim_kb")
+def search(
+    q: str,
+    kb_id: str | None = None,
+    n_results: int = 3,
+    collection_name: str = "claim_kb_a",
+):
+    collection = client.get_or_create_collection(name=collection_name)
 
     if kb_id:
         results = collection.query(
@@ -315,10 +445,9 @@ def ask(req: AskRequest):
             "sources": [],
             "distances": [],
         }
-    
-    prompt=built_prompt(req.question, documents)
-    answer = call_llm(prompt)
 
+    prompt = built_prompt(req.question, documents)
+    answer = call_llm(prompt)
 
     return {
         "question": req.question,
