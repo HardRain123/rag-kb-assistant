@@ -4,6 +4,7 @@ from typing import Any
 from app.core.chroma_client import get_collection
 from app.core.config import DEFAULT_COLLECTION_NAME, DEFAULT_FALLBACK_DISTANCE
 from app.services.rewrite_service import build_rewrite_hints, rewrite_query
+from app.services.rerank_service import rerank_result
 
 
 def query_collection(
@@ -122,6 +123,8 @@ def search_with_optional_rewrite(
         kb_id=kb_id,
     )
     logging.info("Raw recall results: %s", raw_results)
+    rerank_result(query_text, raw_results)
+    logging.info("Reranked raw recall results: %s", raw_results)
 
     rewritten_query = None
     used_queries = [query_text]
