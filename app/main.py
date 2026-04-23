@@ -1,33 +1,26 @@
+import logging
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 import uuid
 
-from dotenv import load_dotenv
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from opentelemetry import context
 from pydantic import BaseModel
-from chromadb import chromadb
-import os
-from openai import OpenAI
-import uvicorn
+
+
 from docx import Document
 
 # 导入你刚才写的切片函数
 from app.services.chunk_service import split_text, split_text_v2
+from app.core.chroma_client import get_chroma_client, get_collection
+from app.core.llm_client import call_llm
+from app.services.rewrite_service import build_rewrite_hints, rewrite_query
 
-load_dotenv()  # 加载 .env 文件中的环境变量
-
-MODEL_API_KEY = os.getenv("MODEL_API_KEY")
-MODEL_BASE_URL = os.getenv("MODEL_BASE_URL")
-MODEL_NAME = os.getenv("MODEL_NAME")
-
-# 初始化 OpenAI 客户端
-llm_client = OpenAI(
-    api_key=MODEL_API_KEY,
-    base_url=MODEL_BASE_URL,
-)
-
-
+logging.basicConfig(level=logging.INFO)
+# Day 9 之后默认走策略 B 的知识库。
+# 原因：你当前的实验、对比文档、以及 rewrite 样例都是基于 claim_kb_b 跑的。
+DEFAULT_COLLECTION_NAME = "claim_kb_b"
+DEFAULT_FALLBACK_DISTANCE = 10**9
 # ------------------------------
 # 1. 初始化 FastAPI 应用
 # ------------------------------
@@ -37,11 +30,6 @@ app = FastAPI(
     description="面向理赔场景的知识库问答系统",
 )
 
-# ------------------------------
-# 2. 初始化 Chroma 客户端
-# ------------------------------
-# 这里先用最简单的本地客户端
-client = chromadb.PersistentClient(path="./data/chroma")
 
 # ------------------------------
 # 3. 本地上传目录
@@ -71,6 +59,7 @@ class AskRequest(BaseModel):
 
     # 检索几个 chunk，默认先取 3 个
     top_k: int = 3
+    use_rewrite: bool = False  # 是否使用重写功能，默认关闭，便于做 A/B 对比
 
 
 def built_prompt(question: str, snippets: list[str]) -> str:
@@ -109,25 +98,6 @@ def health():
     用来确认服务是否正常启动。
     """
     return {"status": "ok"}
-
-
-def call_llm(prompt: str) -> str:
-    if not MODEL_API_KEY or not MODEL_BASE_URL or not MODEL_NAME:
-        raise HTTPException(status_code=500, detail="模型配置缺失，请检查 .env")
-
-    response = llm_client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {
-                "role": "system",
-                "content": "你是一个严格基于上下文回答问题的知识库助手。",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    answer = response.choices[0].message.content
-    return answer or "模型未返回有效内容"
 
 
 # ------------------------------
@@ -252,9 +222,9 @@ def ingest_file(req: IngestRequest):
     # 获取或创建 collection
     # 你可以把它理解成 Chroma 里的一个“集合/表”
     if req.strategy == "a":
-        collection = client.get_or_create_collection(name="claim_kb_a")
+        collection = get_collection(collection_name="claim_kb_a")
     else:
-        collection = client.get_or_create_collection(name="claim_kb_b")
+        collection = get_collection(collection_name=DEFAULT_COLLECTION_NAME)
 
     # 给每个 chunk 生成唯一 id
     # enumerate(chunks) 会返回：
@@ -304,60 +274,6 @@ def get_file_context(saved_path):
     return text
 
 
-@app.post("/ingest_docx")
-def ingest_docx(req: IngestRequest):
-    saved_path = Path(req.saved_path)
-
-    if not saved_path.exists():
-        raise HTTPException(status_code=404, detail="文件不存在，请先上传")
-
-    # 读取 docx 内容
-    document = Document(saved_path)
-    text = "\n".join([para.text for para in document.paragraphs])
-
-    chunks = ingest_with_strategy(
-        text, saved_path, req.kb_id, req.strategy, collection_name="claim_kb"
-    )
-    # chunks = split_text(text, chunk_size=200, overlap=50)
-
-    if not chunks:
-        raise HTTPException(status_code=400, detail="文本为空，无法入库")
-
-    doc_id = saved_path.stem
-
-    if req.strategy == "a":
-        collection = client.get_or_create_collection(name="claim_kb_a")
-    else:
-        collection = client.get_or_create_collection(name="claim_kb_b")
-
-    chunk_ids = [f"{doc_id}_{idx}" for idx, _ in enumerate(chunks)]
-
-    metadatas = [
-        {
-            "chunk_id": chunk_ids[idx],
-            "doc_id": doc_id,
-            "kb_id": req.kb_id,
-            "file_name": saved_path.name,
-            "page": 0,
-            "chunk_index": idx,
-        }
-        for idx, _ in enumerate(chunks)
-    ]
-
-    collection.add(
-        ids=chunk_ids,
-        documents=chunks,
-        metadatas=metadatas,
-    )
-
-    return {
-        "message": "入库成功",
-        "doc_id": doc_id,
-        "chunk_count": len(chunks),
-        "sample_chunk": chunks[0][:100],
-    }
-
-
 def ingest_with_strategy(
     text: str, saved_path: Path, kb_id: str, strategy: str, collection_name: str
 ):
@@ -368,11 +284,245 @@ def ingest_with_strategy(
     else:
         chunks = split_text_v2(
             text,
-            chunk_size=220,
-            overlap=40,
+            chunk_size=300,
+            overlap=50,
             type="markdown" if is_markdown else "default",
         )
     return chunks
+
+
+def query_collection(
+    collection_name: str, query_text: str, n_results: int, kb_id: str | None = None
+) -> dict[str, Any]:
+    # 统一封装一层 collection.query。
+    # 这样 /search 和 /ask 后面都只走这里，避免两边各写各的查询逻辑。
+    collection = get_collection(collection_name=collection_name)
+    query_kwargs: dict[str, Any] = {
+        "query_texts": [query_text],
+        "n_results": max(1, n_results),
+    }
+
+    if kb_id:
+        query_kwargs["where"] = {"kb_id": kb_id}
+
+    return collection.query(**query_kwargs)
+
+
+def extract_result_items(results: dict[str, Any]) -> list[dict[str, Any]]:
+    # Chroma 的返回是二维结构：
+    # documents=[ [...snippets...] ], metadatas=[ [...sources...] ]
+    # 这里把它摊平成统一的 item 列表，后面 merge / 截断都更容易处理。
+    #
+    # results.get("documents", [[]]) 的意思是：
+    # - 如果 results 里有 documents，就取它
+    # - 如果没有，就给一个默认值 [[]]
+    #
+    # 后面的 or [[]] 是第二层兜底：
+    # - 防止取出来的是 None / [] 这类“空值”
+    # - 这样后面统一按二维结构处理，不容易报错
+    documents = results.get("documents", [[]]) or [[]]
+    metadatas = results.get("metadatas", [[]]) or [[]]
+    distances = results.get("distances", [[]]) or [[]]
+
+    # Chroma 支持一次传多个 query。
+    # 但我们这里每次只查 1 个 query，所以只取第 0 个。
+    #
+    # 例如：
+    # documents = [[片段1, 片段2, 片段3]]
+    # 那 document_list 就是 [片段1, 片段2, 片段3]
+    document_list = documents[0] if documents else []
+    metadata_list = metadatas[0] if metadatas else []
+    distance_list = distances[0] if distances else []
+
+    # 最后我们希望得到的结构是：
+    # [
+    #   {"snippet": "...", "source": {...}, "distance": 0.12},
+    #   {"snippet": "...", "source": {...}, "distance": 0.25},
+    # ]
+    items: list[dict[str, Any]] = []
+
+    # enumerate(document_list) 会一边遍历 snippet，一边给出当前下标 idx。
+    # idx=0 对应第一个 snippet，idx=1 对应第二个 snippet，以此类推。
+    for idx, snippet in enumerate(document_list):
+        # 先给 metadata 一个空字典默认值。
+        # 这样即使后面没取到真实 metadata，也不会因为 metadata.get(...) 报错。
+        metadata = {}
+
+        # 这里做两个判断：
+        # 1. idx < len(metadata_list)
+        #    防止 metadata_list 比 document_list 短，直接取 metadata_list[idx] 会越界报错
+        # 2. isinstance(metadata_list[idx], dict)
+        #    确保这个位置上拿到的确实是字典，而不是 None、字符串、列表等别的类型
+        if idx < len(metadata_list) and isinstance(metadata_list[idx], dict):
+            # 只有“下标合法 + 值确实是字典”时，才把它当成当前 snippet 的 metadata。
+            metadata = metadata_list[idx]
+
+        # 先给 distance 一个很大的默认值。
+        # 这样即使后面没拿到真实距离，这条结果也还能参与排序，只是会排得比较靠后。
+        distance = float(DEFAULT_FALLBACK_DISTANCE)
+
+        # 同样先确认下标合法，并且当前位置不是 None。
+        if idx < len(distance_list) and distance_list[idx] is not None:
+            try:
+                # 把距离统一转成 float，后面排序时更稳定。
+                distance = float(distance_list[idx])
+            except (TypeError, ValueError):
+                # 如果这里转换失败，比如拿到了奇怪的值，
+                # 就继续保留前面的兜底大数，不让整条链路崩掉。
+                distance = float(DEFAULT_FALLBACK_DISTANCE)
+
+        # 把当前 snippet、source、distance 打包成统一结构，追加进 items。
+        items.append(
+            {
+                "snippet": snippet,
+                "source": metadata,
+                "distance": distance,
+            }
+        )
+
+    return items
+
+
+def limit_result_items(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    # 按 distance 从小到大排序，然后只取前 limit 条。
+    # 因为在 Chroma 这里，distance 越小，通常表示越相关。
+    return sorted(items, key=lambda item: item["distance"])[:limit]
+
+
+def merge_query_results(
+    raw_results: dict[str, Any], rewrite_results: dict[str, Any], limit: int
+) -> list[dict[str, Any]]:
+    # Day 9 的关键点之一：
+    # 不要让 rewritten query 直接覆盖 raw query，而是两路都保留，再合并。
+    # 这里按 chunk_id 去重；如果同一个 chunk 两边都召回到了，就保留距离更小的那条。
+    merged: dict[str, dict[str, Any]] = {}
+
+    for item in extract_result_items(raw_results) + extract_result_items(
+        rewrite_results
+    ):
+        source = item["source"]
+        key = source.get("chunk_id") or f"{source.get('doc_id')}::{item['snippet']}"
+        existing = merged.get(key)
+        if existing is None or item["distance"] < existing["distance"]:
+            merged[key] = item
+
+    return limit_result_items(list(merged.values()), limit)
+
+
+def build_search_payload(
+    query_text: str,
+    items: list[dict[str, Any]],
+    rewritten_query: str | None,
+    used_queries: list[str],
+    rewrite_hints: list[str],
+) -> dict[str, Any]:
+    # 统一返回结构，避免 /search 和 /ask 一个字段多、一个字段少。
+    return {
+        "query": query_text,
+        "rewritten_query": rewritten_query,
+        "used_queries": used_queries,
+        "rewrite_hints": rewrite_hints,
+        "snippets": [item["snippet"] for item in items],
+        "sources": [item["source"] for item in items],
+        "distances": [item["distance"] for item in items],
+    }
+
+
+def search_with_optional_rewrite(
+    query_text: str,
+    n_results: int,
+    collection_name: str = DEFAULT_COLLECTION_NAME,
+    kb_id: str | None = None,
+    use_rewrite: bool = False,
+) -> dict[str, Any]:
+    # 这里是 Day 9 的主链路，/search 和 /ask 共用：
+    # 1. 先用 raw query 做一次粗召回
+    # 2. 从 raw topN 里抽 hints
+    # 3. 可选地生成 rewritten query
+    # 4. raw / rewrite 两路结果合并
+    # 5. 返回 rewritten_query / used_queries / rewrite_hints
+    # Day 9 里建议“先粗召回，再 rewrite”。
+    # 所以这里不是直接只查 n_results 条，而是至少先查 4 条，
+    # 给 build_rewrite_hints 留一点素材空间。
+    recall_n = max(n_results, 4)
+
+    # 第一步：先用原始 query 做一次 raw recall。
+    raw_results = query_collection(
+        collection_name=collection_name,
+        query_text=query_text,
+        n_results=recall_n,
+        kb_id=kb_id,
+    )
+
+    # 先准备几个默认值：
+    # - rewritten_query: 默认没有改写
+    # - used_queries: 默认只用了原始 query
+    # - rewrite_hints: 默认没有 hints
+    rewritten_query = None
+    used_queries = [query_text]
+    rewrite_hints: list[str] = []
+
+    # 如果调用方明确不想用 rewrite，
+    # 那就直接把 raw_results 截成前 n_results 条返回。
+    if not use_rewrite:
+        raw_items = limit_result_items(extract_result_items(raw_results), n_results)
+        return build_search_payload(
+            query_text=query_text,
+            items=raw_items,
+            rewritten_query=rewritten_query,
+            used_queries=used_queries,
+            rewrite_hints=rewrite_hints,
+        )
+
+    # 第二步：从 raw recall 结果里抽 hints。
+    # 这些 hints 是“受约束 rewrite”的输入，不是给最终答案用的上下文。
+    rewrite_hints = build_rewrite_hints(raw_results)
+    try:
+        # 第三步：基于原问题 + hints 生成 rewritten query。
+        rewritten_query = rewrite_query(query_text, rewrite_hints)
+    except Exception as exc:
+        # rewrite 失败时不能把整个检索链路打断。
+        # 这里直接回退到 raw query，保证 baseline 一直可用。
+        logging.warning("Query rewrite failed and will fall back to raw query: %s", exc)
+        rewritten_query = None
+
+    # 如果没有成功生成 rewritten_query，
+    # 就回退到 raw_results，但仍然把 rewrite_hints 返回出去，方便做记录和排查。
+    if not rewritten_query:
+        raw_items = limit_result_items(extract_result_items(raw_results), n_results)
+        return build_search_payload(
+            query_text=query_text,
+            items=raw_items,
+            rewritten_query=None,
+            used_queries=used_queries,
+            rewrite_hints=rewrite_hints,
+        )
+
+    # 第四步：如果改写成功，就再用 rewritten_query 查一次。
+    rewrite_results = query_collection(
+        collection_name=collection_name,
+        query_text=rewritten_query,
+        n_results=recall_n,
+        kb_id=kb_id,
+    )
+
+    # 第五步：把 raw_results 和 rewrite_results 合并。
+    # 这样 rewrite 就不会覆盖 baseline，而是与 baseline 并行存在。
+    merged_items = merge_query_results(raw_results, rewrite_results, n_results)
+
+    # 把改写后的 query 也记进 used_queries，
+    # 后面接口返回时就能明确告诉调用方“这次实际用了哪几个 query”。
+    used_queries.append(rewritten_query)
+    logging.info("Rewrite query used for retrieval: %s", rewritten_query)
+
+    # 最后统一整理成接口返回结构。
+    return build_search_payload(
+        query_text=query_text,
+        items=merged_items,
+        rewritten_query=rewritten_query,
+        used_queries=used_queries,
+        rewrite_hints=rewrite_hints,
+    )
 
 
 # ------------------------------
@@ -383,32 +533,30 @@ def search(
     q: str,
     kb_id: str | None = None,
     n_results: int = 3,
-    collection_name: str = "claim_kb_a",
+    collection_name: str = DEFAULT_COLLECTION_NAME,
+    use_rewrite: bool = False,
 ):
-    collection = client.get_or_create_collection(name=collection_name)
+    # /search 本身不再单独维护一套 rewrite 逻辑，
+    # 直接复用 search_with_optional_rewrite，方便做 A/B 对比。
+    return search_with_optional_rewrite(
+        query_text=q,
+        n_results=n_results,
+        collection_name=collection_name,
+        kb_id=kb_id,
+        use_rewrite=use_rewrite,
+    )
 
-    if kb_id:
-        results = collection.query(
-            query_texts=[q],
-            n_results=n_results,
-            where={"kb_id": kb_id},
-        )
-    else:
-        results = collection.query(
-            query_texts=[q],
-            n_results=n_results,
-        )
 
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
-    distances = results.get("distances", [[]])[0]
+@app.get("/remove_collection")
+def remove_collection(collection_name: str):
+    """
+    删除 collection 的接口
+    注意：这个操作会永久删除 collection 里的所有数据，请谨慎使用！
+    """
 
-    return {
-        "query": q,
-        "snippets": documents,
-        "sources": metadatas,
-        "distances": distances,
-    }
+    get_chroma_client().delete_collection(name=collection_name)
+
+    return {"message": f"Collection '{collection_name}' 已删除"}
 
 
 @app.post("/ask")
@@ -423,18 +571,15 @@ def ask(req: AskRequest):
     4. 返回 answer + snippets + sources
     """
 
-    # 获取 collection
-    collection = client.get_or_create_collection(name="claim_kb")
-
-    # 用用户问题去做相似检索
-    results = collection.query(query_texts=[req.question], n_results=req.top_k)
-
-    # Chroma 返回的是二维结构
-    # 因为它支持一次查多个 query
-    # 我们现在只查 1 个 query，所以取第 0 个
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
-    distances = results.get("distances", [[]])[0]
+    # 问答接口先复用检索接口的主链路，拿到最终 snippets。
+    # 这样 rewrite 的行为和返回字段可以与 /search 保持一致。
+    search_result = search_with_optional_rewrite(
+        query_text=req.question,
+        n_results=req.top_k,
+        collection_name=DEFAULT_COLLECTION_NAME,
+        use_rewrite=req.use_rewrite,
+    )
+    documents = search_result["snippets"]
 
     # 如果没查到内容
     if not documents:
@@ -444,6 +589,9 @@ def ask(req: AskRequest):
             "snippets": [],
             "sources": [],
             "distances": [],
+            "rewritten_query": search_result["rewritten_query"],
+            "used_queries": search_result["used_queries"],
+            "rewrite_hints": search_result["rewrite_hints"],
         }
 
     prompt = built_prompt(req.question, documents)
@@ -453,22 +601,9 @@ def ask(req: AskRequest):
         "question": req.question,
         "answer": answer,
         "snippets": documents,  # 检索到的原文片段
-        "sources": metadatas,  # 每个片段的来源信息
-        "distances": distances,  # 相似度距离
+        "sources": search_result["sources"],  # 每个片段的来源信息
+        "distances": search_result["distances"],  # 相似度距离
+        "rewritten_query": search_result["rewritten_query"],
+        "used_queries": search_result["used_queries"],
+        "rewrite_hints": search_result["rewrite_hints"],
     }
-
-
-def build_fake_answer(question: str, snippets: list[str]) -> str:
-    """
-    先用一个假的回答函数，帮助你理解 ask 的完整流程。
-    后面你再把这里替换成真实模型调用。
-    """
-
-    if not snippets:
-        return "没有检索到相关内容，暂时无法回答。"
-
-    # 这里先简单返回“基于检索内容的摘要”
-    # 后面再替换成真实大模型调用
-    joined = "\n".join(snippets[:2])
-
-    return f"问题：{question}\n\n基于检索到的内容，相关信息如下：\n{joined[:300]}"
