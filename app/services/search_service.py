@@ -10,7 +10,7 @@ from app.services.rerank_service import rerank_result
 def query_collection(
     collection_name: str, query_text: str, n_results: int, kb_id: str | None = None
 ) -> dict[str, Any]:
-    """统一封装 Chroma 查询，避免 /search 和 /ask 各自维护一套逻辑。"""
+    """Wrap Chroma querying so /search and /ask share one retrieval path."""
     collection = get_collection(collection_name=collection_name)
     query_kwargs: dict[str, Any] = {
         "query_texts": [query_text],
@@ -24,10 +24,7 @@ def query_collection(
 
 
 def extract_result_items(results: dict[str, Any]) -> list[dict[str, Any]]:
-    """
-    把 Chroma 的二维返回结构摊平成统一 item 列表，
-    这样后面截断、合并、排序都会更直观。
-    """
+    """Flatten one Chroma query result into a stable item list."""
     documents = results.get("documents", [[]]) or [[]]
     metadatas = results.get("metadatas", [[]]) or [[]]
     distances = results.get("distances", [[]]) or [[]]
@@ -68,8 +65,8 @@ def merge_query_results(
     raw_results: dict[str, Any], rewrite_results: dict[str, Any], limit: int
 ) -> list[dict[str, Any]]:
     """
-    Day 9 的关键点之一：
-    rewrite 不覆盖 baseline，而是把 raw / rewrite 两路结果合并。
+    Deduplicate raw and rewritten results while keeping the existing reranked
+    order. If the same chunk shows up twice, keep the lower-distance item.
     """
     merged: dict[str, dict[str, Any]] = {}
 
@@ -79,10 +76,13 @@ def merge_query_results(
         source = item["source"]
         key = source.get("chunk_id") or f"{source.get('doc_id')}::{item['snippet']}"
         existing = merged.get(key)
-        if existing is None or item["distance"] < existing["distance"]:
+
+        if existing is None:
+            merged[key] = item
+        elif item["distance"] < existing["distance"]:
             merged[key] = item
 
-    return limit_result_items(list(merged.values()), limit)
+    return list(merged.values())[:limit]
 
 
 def build_search_payload(
@@ -111,8 +111,8 @@ def search_with_optional_rewrite(
     use_rewrite: bool = False,
 ) -> dict[str, Any]:
     """
-    /search 和 /ask 共用的主检索链路：
-    先 raw recall，再可选 rewrite，最后统一整理返回结构。
+    Shared retrieval flow for /search and /ask:
+    raw recall first, optional rewrite next, then one final payload shape.
     """
     recall_n = max(n_results, 4)
 
@@ -123,7 +123,8 @@ def search_with_optional_rewrite(
         kb_id=kb_id,
     )
     logging.info("Raw recall results: %s", raw_results)
-    rerank_result(query_text, raw_results)
+
+    raw_results = rerank_result(query_text, raw_results)
     logging.info("Reranked raw recall results: %s", raw_results)
 
     rewritten_query = None
@@ -131,7 +132,7 @@ def search_with_optional_rewrite(
     rewrite_hints: list[str] = []
 
     if not use_rewrite:
-        raw_items = limit_result_items(extract_result_items(raw_results), n_results)
+        raw_items = extract_result_items(raw_results)[:n_results]
         logging.info("Final search results (raw only): %s", raw_items)
         return build_search_payload(
             query_text=query_text,
@@ -149,7 +150,7 @@ def search_with_optional_rewrite(
         rewritten_query = None
 
     if not rewritten_query:
-        raw_items = limit_result_items(extract_result_items(raw_results), n_results)
+        raw_items = extract_result_items(raw_results)[:n_results]
         return build_search_payload(
             query_text=query_text,
             items=raw_items,
@@ -164,6 +165,8 @@ def search_with_optional_rewrite(
         n_results=recall_n,
         kb_id=kb_id,
     )
+    rewrite_results = rerank_result(rewritten_query, rewrite_results)
+    logging.info("Reranked rewrite recall results: %s", rewrite_results)
 
     merged_items = merge_query_results(raw_results, rewrite_results, n_results)
     used_queries.append(rewritten_query)
