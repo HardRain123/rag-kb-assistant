@@ -7,8 +7,8 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.core.chroma_client import get_chroma_client
 from app.core.config import UPLOAD_DIR
-from app.schemas.upload import IngestRequest
-from app.services.ingest_service import ingest_saved_file
+from app.schemas.upload import IngestRequest, ReplaceFileRequest
+from app.services.ingest_service import ingest_saved_file, replace_saved_file
 
 
 router = APIRouter(tags=["upload"])
@@ -57,6 +57,23 @@ def ingest_file(req: IngestRequest):
         saved_path=saved_path,
         kb_id=req.kb_id,
         strategy=req.strategy,
+        doc_type_override=req.doc_type_override,
+    )
+
+
+@router.post("/replace_file")
+def replace_file(req: ReplaceFileRequest):
+    saved_path = Path(req.saved_path)
+    if not saved_path.exists():
+        raise HTTPException(status_code=404, detail="文件不存在，请先上传")
+
+    return replace_saved_file(
+        saved_path=saved_path,
+        kb_id=req.kb_id,
+        strategy=req.strategy,
+        old_doc_id=req.old_doc_id,
+        new_doc_id=req.new_doc_id,
+        doc_type_override=req.doc_type_override,
     )
 
 

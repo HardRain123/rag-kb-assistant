@@ -2,6 +2,12 @@ import re
 from typing import Any
 import jieba
 
+from app.services.query_intent_service import (
+    classify_query_intent,
+    is_process_chunk,
+    is_process_doc,
+)
+
 
 TITLE_PATTERN = re.compile(r"^(第?\d+[章节]|小结|总结|结论|要点|#{1,6}\s*.+)")
 # 1. 停用词：去掉“问法词 / 语气词 / 指代词”，保留真正有业务意义的词
@@ -119,6 +125,34 @@ DOMAIN_TERMS = {
     "补件",
 }
 
+PROCESS_ENTRY_KEYWORDS = (
+    "报案",
+    "通知",
+    "申请方式",
+    "提交申请",
+    "理赔入口",
+)
+
+PROCESS_CHANNEL_KEYWORDS = (
+    "线上申请",
+    "线下申请",
+    "线上提交",
+    "线下提交",
+    "申请方式",
+)
+
+PROCESS_LATE_STAGE_KEYWORDS = (
+    "准备材料",
+    "最小材料包",
+    "进入审核",
+    "形成结论",
+    "支付与到账",
+)
+
+
+def contains_any_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    return any(keyword in text for keyword in keywords)
+
 
 def rerank_result(question: str, results: dict[str, Any]) -> dict[str, Any]:
     """
@@ -138,6 +172,7 @@ def rerank_result(question: str, results: dict[str, Any]) -> dict[str, Any]:
     metadata_list = metadatas[0] if metadatas else []
     distance_list = distances[0] if distances else []
     init_tokenizer()
+    query_intent = classify_query_intent(question)
 
     question_words = [
         word for word in jieba.lcut(question) if word not in STOP_WORDS and word.strip()
@@ -148,12 +183,51 @@ def rerank_result(question: str, results: dict[str, Any]) -> dict[str, Any]:
     for idx, doc in enumerate(snippets):
         metadata = metadata_list[idx] if idx < len(metadata_list) else {}
         distance = distance_list[idx] if idx < len(distance_list) else None
+        file_name = metadata.get("file_name", "")
+        doc_type = metadata.get("doc_type")
+        chunk_type = metadata.get("chunk_type")
+        heading_path = metadata.get("heading_path", "")
 
         keyword_hits = sum(1 for word in question_words if word in doc)
         title_bonus = 2 if TITLE_PATTERN.search(doc) else 0
         distance_score = -float(distance) if distance is not None else 0.0
+        intent_bonus = 0
 
-        score = keyword_hits * 3 + title_bonus + distance_score
+        # Process questions should prefer the main SOP over scene docs, and
+        # then prefer the chunk whose heading matches the user's process focus.
+        if query_intent in {"process", "process_entry", "process_channel"}:
+            if is_process_doc(file_name=file_name, doc_type=doc_type):
+                if doc_type == "sop" or "_05_sop_" in file_name:
+                    intent_bonus += 6
+                else:
+                    intent_bonus += 1
+
+            if is_process_chunk(
+                snippet=doc,
+                heading_path=heading_path,
+                chunk_type=chunk_type,
+            ):
+                intent_bonus += 2
+
+            if query_intent == "process_entry":
+                if contains_any_keyword(doc, PROCESS_ENTRY_KEYWORDS):
+                    intent_bonus += 6
+                if contains_any_keyword(doc, PROCESS_LATE_STAGE_KEYWORDS):
+                    intent_bonus -= 2
+
+            elif query_intent == "process_channel":
+                if contains_any_keyword(doc, PROCESS_CHANNEL_KEYWORDS):
+                    intent_bonus += 8
+                if "_06_sop_" in file_name:
+                    intent_bonus -= 2
+                if contains_any_keyword(doc, PROCESS_LATE_STAGE_KEYWORDS):
+                    intent_bonus -= 3
+
+            else:
+                if contains_any_keyword(doc, PROCESS_ENTRY_KEYWORDS + PROCESS_CHANNEL_KEYWORDS):
+                    intent_bonus += 4
+
+        score = keyword_hits * 3 + title_bonus + distance_score + intent_bonus
         scored.append((score, idx, doc, metadata, distance))
 
     scored.sort(key=lambda item: item[0], reverse=True)
