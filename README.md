@@ -7,6 +7,7 @@
 - Query Rewrite 与 Light Rerank
 - `/ask` 的 SQLite 审计记录
 - 异常处理与降级
+- `citations / confidence` 结构化输出
 
 
 ## 项目定位
@@ -47,6 +48,7 @@
   - 先检索，再基于上下文问答
   - 返回 `request_id`
   - 返回 `rewritten_query / used_queries / rewrite_hints`
+  - 返回 `citations / confidence`
   - 返回 `fallback_reason / fallback_reasons`
 
 ### 3. 审计与降级
@@ -218,6 +220,16 @@ curl -X POST "http://127.0.0.1:8000/upload_file" \
     "住院理赔需要提交哪些材料"
   ],
   "rewrite_hints": [],
+  "citations": [
+    {
+      "doc_id": "faq_01",
+      "file_name": "faq.md",
+      "chunk_id": "c1",
+      "snippet": "住院理赔通常需要提供发票、费用明细和诊断证明。",
+      "distance": 0.12
+    }
+  ],
+  "confidence": "medium",
   "fallback_reason": null,
   "fallback_reasons": []
 }
@@ -298,6 +310,13 @@ curl "http://127.0.0.1:8000/ask_audit/f4a2239f-b031-4942-ab2e-ded08ffc83b1"
 - `top_k`：默认 `3`
 - `use_rewrite`：默认 `false`
 
+返回重点：
+
+- `answer`
+- `citations`
+- `confidence`
+- `fallback_reason / fallback_reasons`
+
 ### `GET /ask_audit`
 
 查询 ask 审计记录。
@@ -328,6 +347,8 @@ curl "http://127.0.0.1:8000/ask_audit/f4a2239f-b031-4942-ab2e-ded08ffc83b1"
 - `retrieval_count`
 - `sources_json`
 - `distances_json`
+- `citations_json`
+- `confidence`
 - `latency_ms`
 - `fallback_reason`
 - `error_type`
@@ -336,7 +357,15 @@ curl "http://127.0.0.1:8000/ask_audit/f4a2239f-b031-4942-ab2e-ded08ffc83b1"
 说明：
 
 - 通过接口读取时，`used_queries_json / sources_json / distances_json` 会直接解析成列表或对象
+- `citations_json` 也会通过接口直接解析成列表
 - 当前只记录 `/ask`，还没有把上传和入库统一写进 SQLite 审计表
+
+## Confidence 与 Fallback 的关系
+
+- `confidence` 是证据型判断，主要看 `citations` 数量和结果集中度
+- `fallback_reason / fallback_reasons` 是链路诊断字段，用来说明 rewrite、rerank、llm 或检索阶段是否触发过兜底
+- `rewrite_failed / rerank_failed` 不会直接拉低 `confidence`
+- `no_retrieval_result / search_failed / llm_failed` 会返回 `low`，因为这几类结果没有形成可支撑答案的有效输出
 
 ## 异常处理与降级
 
@@ -363,7 +392,6 @@ curl "http://127.0.0.1:8000/ask_audit/f4a2239f-b031-4942-ab2e-ded08ffc83b1"
 
 - 还没有用户鉴权、权限隔离、前端页面、异步任务队列
 - 还没有 Hybrid Retrieval、重试队列、统一观测平台
-- `fallback_reason` 已经有了，但 `confidence` 规则还没落地到接口返回
 - SQLite 审计目前只覆盖 `/ask`
 
 ## 后续可以继续补的方向

@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.core.config import DEFAULT_COLLECTION_NAME
 from app.core.llm_client import call_llm
-from app.schemas.ask import AskRequest
+from app.schemas.ask import AskRequest, AskResponse
 from app.services.ask_audit_service import (
     get_ask_audit,
     list_ask_audits,
@@ -19,6 +19,13 @@ from app.services.search_service import search_with_optional_rewrite
 
 router = APIRouter(tags=["ask"])
 logger = logging.getLogger(__name__)
+LOW_CONFIDENCE_FALLBACK_REASONS = {
+    "no_retrieval_result",
+    "search_failed",
+    "llm_failed",
+}
+HIGH_CITATION_MIN = 2
+HIGH_DISTANCE_SPREAD_MAX = 0.08
 
 
 def elapsed_ms(started_at: float) -> int:
@@ -37,6 +44,58 @@ def extract_fallback_reasons(search_result: dict | None) -> list[str]:
     return [fallback_reason] if fallback_reason else []
 
 
+def build_citations(search_result: dict | None) -> list[dict]:
+    search_result = search_result or {}
+    snippets = search_result.get("snippets", []) or []
+    sources = search_result.get("sources", []) or []
+    distances = search_result.get("distances", []) or []
+    citations: list[dict] = []
+
+    for idx, snippet in enumerate(snippets):
+        source = sources[idx] if idx < len(sources) and isinstance(sources[idx], dict) else {}
+        citation = {
+            "doc_id": str(source.get("doc_id") or ""),
+            "file_name": str(source.get("file_name") or ""),
+            "chunk_id": str(source.get("chunk_id") or ""),
+            "snippet": snippet,
+        }
+
+        doc_type = source.get("doc_type")
+        if doc_type is not None:
+            citation["doc_type"] = str(doc_type)
+
+        chunk_index = source.get("chunk_index")
+        if isinstance(chunk_index, int):
+            citation["chunk_index"] = chunk_index
+
+        distance = distances[idx] if idx < len(distances) else None
+        if isinstance(distance, (int, float)):
+            citation["distance"] = float(distance)
+
+        citations.append(citation)
+
+    return citations
+
+
+def judge_confidence(
+    citations: list[dict],
+    distances: list[float],
+    fallback_reasons: list[str],
+) -> str:
+    if not citations or any(
+        reason in LOW_CONFIDENCE_FALLBACK_REASONS for reason in fallback_reasons
+    ):
+        return "low"
+
+    valid_distances = [value for value in distances if isinstance(value, (int, float))]
+    if len(citations) >= HIGH_CITATION_MIN and len(valid_distances) >= 2:
+        distance_spread = abs(float(valid_distances[1]) - float(valid_distances[0]))
+        if distance_spread <= HIGH_DISTANCE_SPREAD_MAX:
+            return "high"
+
+    return "medium"
+
+
 def build_ask_response(
     *,
     request_id: str,
@@ -49,6 +108,9 @@ def build_ask_response(
     fallback_reasons = extract_fallback_reasons(search_result)
     if fallback_reason and fallback_reason not in fallback_reasons:
         fallback_reasons.append(fallback_reason)
+    citations = build_citations(search_result)
+    distances = search_result.get("distances", []) or []
+    confidence = judge_confidence(citations, distances, fallback_reasons)
 
     return {
         "request_id": request_id,
@@ -62,6 +124,8 @@ def build_ask_response(
         "rewrite_hints": search_result.get("rewrite_hints", []) or [],
         "fallback_reason": fallback_reason or search_result.get("fallback_reason"),
         "fallback_reasons": fallback_reasons,
+        "citations": citations,
+        "confidence": confidence,
     }
 
 
@@ -79,6 +143,15 @@ def build_ask_audit_record(
     search_result = search_result or {}
     snippets = search_result.get("snippets", []) or []
     search_fallback_reason = search_result.get("fallback_reason")
+    fallback_reasons = extract_fallback_reasons(search_result)
+    if fallback_reason and fallback_reason not in fallback_reasons:
+        fallback_reasons.append(fallback_reason)
+    citations = build_citations(search_result)
+    confidence = judge_confidence(
+        citations,
+        search_result.get("distances", []) or [],
+        fallback_reasons,
+    )
 
     return {
         "request_id": request_id,
@@ -92,6 +165,8 @@ def build_ask_audit_record(
         "retrieval_count": len(snippets),
         "sources_json": to_json(search_result.get("sources", []) or []),
         "distances_json": to_json(search_result.get("distances", []) or []),
+        "citations_json": to_json(citations),
+        "confidence": confidence,
         "latency_ms": elapsed_ms(started_at),
         "fallback_reason": fallback_reason or search_fallback_reason,
         "error_type": type(error).__name__ if error else None,
@@ -199,7 +274,7 @@ def get_ask_audit_record(request_id: str):
     return record
 
 
-@router.post("/ask")
+@router.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     request_id = str(uuid.uuid4())
     started_at = time.perf_counter()

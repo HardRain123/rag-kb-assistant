@@ -220,7 +220,9 @@ def rerank_with_fallback(
     try:
         return rerank_result(question, results)
     except Exception as exc:
-        logger.warning("Rerank failed and will fall back to original recall order: %s", exc)
+        logger.warning(
+            "Rerank failed and will fall back to original recall order: %s", exc
+        )
         append_fallback_reason(fallback_reasons, "rerank_failed")
         return results
 

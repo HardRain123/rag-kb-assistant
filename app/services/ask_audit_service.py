@@ -22,6 +22,8 @@ ASK_AUDIT_FIELDS = [
     "retrieval_count",
     "sources_json",
     "distances_json",
+    "citations_json",
+    "confidence",
     "latency_ms",
     "fallback_reason",
     "error_type",
@@ -29,7 +31,16 @@ ASK_AUDIT_FIELDS = [
 ]
 
 logger = logging.getLogger(__name__)
-JSON_TEXT_FIELDS = ("used_queries_json", "sources_json", "distances_json")
+JSON_TEXT_FIELDS = (
+    "used_queries_json",
+    "sources_json",
+    "distances_json",
+    "citations_json",
+)
+MIGRATION_COLUMNS = {
+    "citations_json": "TEXT",
+    "confidence": "TEXT",
+}
 
 
 def utc_now_iso() -> str:
@@ -78,6 +89,8 @@ def init_ask_audit_db() -> None:
                 retrieval_count INTEGER NOT NULL,
                 sources_json TEXT,
                 distances_json TEXT,
+                citations_json TEXT,
+                confidence TEXT,
                 latency_ms INTEGER NOT NULL,
                 fallback_reason TEXT,
                 error_type TEXT,
@@ -85,6 +98,15 @@ def init_ask_audit_db() -> None:
             )
             """
         )
+        existing_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(ask_audit)").fetchall()
+        }
+        for column_name, column_type in MIGRATION_COLUMNS.items():
+            if column_name not in existing_columns:
+                conn.execute(
+                    f"ALTER TABLE ask_audit ADD COLUMN {column_name} {column_type}"
+                )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ask_audit_created_at "
             "ON ask_audit(created_at)"
@@ -113,6 +135,8 @@ def save_ask_audit(record: dict[str, Any]) -> None:
         "retrieval_count": int(record.get("retrieval_count") or 0),
         "sources_json": record.get("sources_json") or to_json([]),
         "distances_json": record.get("distances_json") or to_json([]),
+        "citations_json": record.get("citations_json") or to_json([]),
+        "confidence": record.get("confidence"),
         "latency_ms": int(record.get("latency_ms") or 0),
         "fallback_reason": record.get("fallback_reason"),
         "error_type": record.get("error_type"),
