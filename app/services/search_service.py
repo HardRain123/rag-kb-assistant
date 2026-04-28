@@ -10,6 +10,8 @@ from app.services.query_intent_service import (
 from app.services.rewrite_service import build_rewrite_hints, rewrite_query
 from app.services.rerank_service import rerank_result
 
+logger = logging.getLogger(__name__)
+
 
 def query_collection(
     collection_name: str,
@@ -190,16 +192,37 @@ def build_search_payload(
     rewritten_query: str | None,
     used_queries: list[str],
     rewrite_hints: list[str],
+    fallback_reasons: list[str],
 ) -> dict[str, Any]:
     return {
         "query": query_text,
         "rewritten_query": rewritten_query,
         "used_queries": used_queries,
         "rewrite_hints": rewrite_hints,
+        "fallback_reasons": fallback_reasons,
+        "fallback_reason": fallback_reasons[-1] if fallback_reasons else None,
         "snippets": [item["snippet"] for item in items],
         "sources": [item["source"] for item in items],
         "distances": [item["distance"] for item in items],
     }
+
+
+def append_fallback_reason(fallback_reasons: list[str], reason: str) -> None:
+    if reason not in fallback_reasons:
+        fallback_reasons.append(reason)
+
+
+def rerank_with_fallback(
+    question: str,
+    results: dict[str, Any],
+    fallback_reasons: list[str],
+) -> dict[str, Any]:
+    try:
+        return rerank_result(question, results)
+    except Exception as exc:
+        logger.warning("Rerank failed and will fall back to original recall order: %s", exc)
+        append_fallback_reason(fallback_reasons, "rerank_failed")
+        return results
 
 
 def search_with_optional_rewrite(
@@ -215,6 +238,7 @@ def search_with_optional_rewrite(
     """
     recall_n = max(n_results, 4)
     query_intent = classify_query_intent(query_text)
+    fallback_reasons: list[str] = []
 
     raw_results = query_with_intent_priority(
         collection_name=collection_name,
@@ -223,10 +247,10 @@ def search_with_optional_rewrite(
         kb_id=kb_id,
         query_intent=query_intent,
     )
-    logging.info("Raw recall results: %s", raw_results)
+    logger.info("Raw recall results: %s", raw_results)
 
-    raw_results = rerank_result(query_text, raw_results)
-    logging.info("Reranked raw recall results: %s", raw_results)
+    raw_results = rerank_with_fallback(query_text, raw_results, fallback_reasons)
+    logger.info("Reranked raw recall results: %s", raw_results)
 
     rewritten_query = None
     used_queries = [query_text]
@@ -234,20 +258,22 @@ def search_with_optional_rewrite(
 
     if not use_rewrite:
         raw_items = extract_result_items(raw_results)[:n_results]
-        logging.info("Final search results (raw only): %s", raw_items)
+        logger.info("Final search results (raw only): %s", raw_items)
         return build_search_payload(
             query_text=query_text,
             items=raw_items,
             rewritten_query=rewritten_query,
             used_queries=used_queries,
             rewrite_hints=rewrite_hints,
+            fallback_reasons=fallback_reasons,
         )
 
     rewrite_hints = build_rewrite_hints(raw_results)
     try:
         rewritten_query = rewrite_query(query_text, rewrite_hints)
     except Exception as exc:
-        logging.warning("Query rewrite failed and will fall back to raw query: %s", exc)
+        logger.warning("Query rewrite failed and will fall back to raw query: %s", exc)
+        append_fallback_reason(fallback_reasons, "rewrite_failed")
         rewritten_query = None
 
     if not rewritten_query:
@@ -258,6 +284,7 @@ def search_with_optional_rewrite(
             rewritten_query=None,
             used_queries=used_queries,
             rewrite_hints=rewrite_hints,
+            fallback_reasons=fallback_reasons,
         )
 
     rewrite_results = query_with_intent_priority(
@@ -267,12 +294,14 @@ def search_with_optional_rewrite(
         kb_id=kb_id,
         query_intent=query_intent,
     )
-    rewrite_results = rerank_result(rewritten_query, rewrite_results)
-    logging.info("Reranked rewrite recall results: %s", rewrite_results)
+    rewrite_results = rerank_with_fallback(
+        rewritten_query, rewrite_results, fallback_reasons
+    )
+    logger.info("Reranked rewrite recall results: %s", rewrite_results)
 
     merged_items = merge_query_results(raw_results, rewrite_results, n_results)
     used_queries.append(rewritten_query)
-    logging.info("Rewrite query used for retrieval: %s", rewritten_query)
+    logger.info("Rewrite query used for retrieval: %s", rewritten_query)
 
     return build_search_payload(
         query_text=query_text,
@@ -280,4 +309,5 @@ def search_with_optional_rewrite(
         rewritten_query=rewritten_query,
         used_queries=used_queries,
         rewrite_hints=rewrite_hints,
+        fallback_reasons=fallback_reasons,
     )

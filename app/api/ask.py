@@ -1,3 +1,4 @@
+import logging
 import time
 import uuid
 
@@ -17,10 +18,51 @@ from app.services.search_service import search_with_optional_rewrite
 
 
 router = APIRouter(tags=["ask"])
+logger = logging.getLogger(__name__)
 
 
 def elapsed_ms(started_at: float) -> int:
     return int((time.perf_counter() - started_at) * 1000)
+
+
+def extract_fallback_reasons(search_result: dict | None) -> list[str]:
+    if not search_result:
+        return []
+
+    fallback_reasons = search_result.get("fallback_reasons")
+    if isinstance(fallback_reasons, list):
+        return [reason for reason in fallback_reasons if reason]
+
+    fallback_reason = search_result.get("fallback_reason")
+    return [fallback_reason] if fallback_reason else []
+
+
+def build_ask_response(
+    *,
+    request_id: str,
+    question: str,
+    answer: str,
+    search_result: dict | None,
+    fallback_reason: str | None = None,
+) -> dict:
+    search_result = search_result or {}
+    fallback_reasons = extract_fallback_reasons(search_result)
+    if fallback_reason and fallback_reason not in fallback_reasons:
+        fallback_reasons.append(fallback_reason)
+
+    return {
+        "request_id": request_id,
+        "question": question,
+        "answer": answer,
+        "snippets": search_result.get("snippets", []) or [],
+        "sources": search_result.get("sources", []) or [],
+        "distances": search_result.get("distances", []) or [],
+        "rewritten_query": search_result.get("rewritten_query"),
+        "used_queries": search_result.get("used_queries", []) or [],
+        "rewrite_hints": search_result.get("rewrite_hints", []) or [],
+        "fallback_reason": fallback_reason or search_result.get("fallback_reason"),
+        "fallback_reasons": fallback_reasons,
+    }
 
 
 def build_ask_audit_record(
@@ -36,6 +78,7 @@ def build_ask_audit_record(
 ) -> dict:
     search_result = search_result or {}
     snippets = search_result.get("snippets", []) or []
+    search_fallback_reason = search_result.get("fallback_reason")
 
     return {
         "request_id": request_id,
@@ -50,7 +93,7 @@ def build_ask_audit_record(
         "sources_json": to_json(search_result.get("sources", []) or []),
         "distances_json": to_json(search_result.get("distances", []) or []),
         "latency_ms": elapsed_ms(started_at),
-        "fallback_reason": fallback_reason,
+        "fallback_reason": fallback_reason or search_fallback_reason,
         "error_type": type(error).__name__ if error else None,
         "error_message": str(error) if error else None,
     }
@@ -171,35 +214,41 @@ def ask(req: AskRequest):
             use_rewrite=req.use_rewrite,
         )
     except Exception as exc:
+        answer = "检索过程暂时异常，请稍后再试。"
+        logger.warning("Ask search failed and will return fallback response: %s", exc)
+        response = build_ask_response(
+            request_id=request_id,
+            question=req.question,
+            answer=answer,
+            search_result=None,
+            fallback_reason="search_failed",
+        )
         safe_save_ask_audit(
             build_ask_audit_record(
                 request_id=request_id,
                 req=req,
                 started_at=started_at,
                 status="error",
-                answer=None,
+                answer=answer,
                 search_result=search_result,
                 fallback_reason="search_failed",
                 error=exc,
             )
         )
-        raise
+        return response
 
     documents = search_result["snippets"]
 
     if not documents:
         answer = "没有检索到相关内容，暂时无法回答。"
-        response = {
-            "request_id": request_id,
-            "question": req.question,
-            "answer": answer,
-            "snippets": [],
-            "sources": [],
-            "distances": [],
-            "rewritten_query": search_result["rewritten_query"],
-            "used_queries": search_result["used_queries"],
-            "rewrite_hints": search_result["rewrite_hints"],
-        }
+        logger.info("Ask returned no retrieval result for request_id=%s", request_id)
+        response = build_ask_response(
+            request_id=request_id,
+            question=req.question,
+            answer=answer,
+            search_result=search_result,
+            fallback_reason="no_retrieval_result",
+        )
         safe_save_ask_audit(
             build_ask_audit_record(
                 request_id=request_id,
@@ -217,31 +266,35 @@ def ask(req: AskRequest):
     try:
         answer = call_llm(prompt)
     except Exception as exc:
+        answer = "模型服务暂时不可用，请稍后再试。"
+        logger.warning("Ask LLM failed and will return fallback response: %s", exc)
+        response = build_ask_response(
+            request_id=request_id,
+            question=req.question,
+            answer=answer,
+            search_result=search_result,
+            fallback_reason="llm_failed",
+        )
         safe_save_ask_audit(
             build_ask_audit_record(
                 request_id=request_id,
                 req=req,
                 started_at=started_at,
                 status="error",
-                answer=None,
+                answer=answer,
                 search_result=search_result,
                 fallback_reason="llm_failed",
                 error=exc,
             )
         )
-        raise
+        return response
 
-    response = {
-        "request_id": request_id,
-        "question": req.question,
-        "answer": answer,
-        "snippets": documents,
-        "sources": search_result["sources"],
-        "distances": search_result["distances"],
-        "rewritten_query": search_result["rewritten_query"],
-        "used_queries": search_result["used_queries"],
-        "rewrite_hints": search_result["rewrite_hints"],
-    }
+    response = build_ask_response(
+        request_id=request_id,
+        question=req.question,
+        answer=answer,
+        search_result=search_result,
+    )
     safe_save_ask_audit(
         build_ask_audit_record(
             request_id=request_id,

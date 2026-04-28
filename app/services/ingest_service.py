@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,8 @@ from app.services.query_intent_service import (
     infer_doc_type,
 )
 from app.utils.file_utils import get_file_context
+
+logger = logging.getLogger(__name__)
 
 
 def ingest_with_strategy(text: str, saved_path: Path, strategy: str) -> list[str]:
@@ -69,7 +72,7 @@ def ingest_saved_file(
     这里承接“读取文件 -> 切片 -> 写入 Chroma”的主流程，
     路由层只负责接 HTTP 参数和返回结果。
     """
-    text = get_file_context(saved_path)
+    text = load_file_text(saved_path)
     chunks = ingest_with_strategy(text=text, saved_path=saved_path, strategy=strategy)
 
     if not chunks:
@@ -145,7 +148,7 @@ def replace_saved_file(
     add the new version first, then remove the old version so a failed add does
     not wipe the currently searchable document.
     """
-    text = get_file_context(saved_path)
+    text = load_file_text(saved_path)
     chunks = ingest_with_strategy(text=text, saved_path=saved_path, strategy=strategy)
     if not chunks:
         raise HTTPException(status_code=400, detail="新文件文本为空，无法替换入库")
@@ -188,3 +191,20 @@ def replace_saved_file(
         "collection_name": delete_result["collection_name"],
         "sample_chunk": ingest_result["sample_chunk"],
     }
+
+
+def load_file_text(saved_path: Path) -> str:
+    try:
+        text = get_file_context(saved_path)
+    except UnicodeDecodeError as exc:
+        logger.warning("Ingest rejected because file encoding is not UTF-8: %s", saved_path)
+        raise HTTPException(status_code=400, detail="文件编码不是 UTF-8，暂时无法读取") from exc
+    except Exception as exc:
+        logger.warning("Ingest rejected because file read failed: %s", exc)
+        raise HTTPException(status_code=400, detail=f"文件读取失败：{exc}") from exc
+
+    if not text or not text.strip():
+        logger.warning("Ingest rejected because extracted text is empty: %s", saved_path)
+        raise HTTPException(status_code=400, detail="文本为空，无法入库")
+
+    return text

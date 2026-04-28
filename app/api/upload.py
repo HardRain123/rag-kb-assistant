@@ -1,4 +1,5 @@
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Annotated
@@ -12,6 +13,7 @@ from app.services.ingest_service import ingest_saved_file, replace_saved_file
 
 
 router = APIRouter(tags=["upload"])
+logger = logging.getLogger(__name__)
 
 
 @router.post("/upload_file")
@@ -24,9 +26,11 @@ async def upload_file(
     真正的切片和入库放到 ingest 接口里。
     """
     if not file.filename:
+        logger.warning("Upload rejected because no filename was provided")
         raise HTTPException(status_code=400, detail="未选择文件")
 
     if not file.filename.endswith((".txt", ".docx", ".doc", ".md")):
+        logger.warning("Upload rejected because file type is not supported: %s", file.filename)
         raise HTTPException(
             status_code=400, detail="当前阶段只支持 txt、docx、doc 和 md 文件"
         )
@@ -36,6 +40,10 @@ async def upload_file(
     save_path = UPLOAD_DIR / save_name
 
     content = await file.read()
+    if not content:
+        logger.warning("Upload rejected because file content is empty: %s", file.filename)
+        raise HTTPException(status_code=400, detail="上传文件为空")
+
     with open(save_path, "wb") as output_file:
         output_file.write(content)
 

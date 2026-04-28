@@ -29,6 +29,7 @@ ASK_AUDIT_FIELDS = [
 ]
 
 logger = logging.getLogger(__name__)
+JSON_TEXT_FIELDS = ("used_queries_json", "sources_json", "distances_json")
 
 
 def utc_now_iso() -> str:
@@ -39,17 +40,29 @@ def to_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+def parse_json_text(value: Any) -> Any:
+    if not isinstance(value, str) or not value:
+        return value
+
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
+
+
 def _connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.execute("PRAGMA journal_mode=MEMORY")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.text_factory = lambda value: value.decode("utf-8", errors="replace")
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_ask_audit_db() -> None:
     with _connect() as conn:
+        conn.execute("PRAGMA encoding = 'UTF-8'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ask_audit (
@@ -127,6 +140,8 @@ def safe_save_ask_audit(record: dict[str, Any]) -> None:
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     data["use_rewrite"] = bool(data["use_rewrite"])
+    for field in JSON_TEXT_FIELDS:
+        data[field] = parse_json_text(data.get(field))
     return data
 
 

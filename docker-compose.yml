@@ -1,0 +1,14 @@
+services:
+  rag-kb-assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-kb-assistant
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data/uploads:/app/data/uploads
+      - ./data/chroma:/app/data/chroma
+    restart: unless-stopped
