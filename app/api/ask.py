@@ -1,13 +1,59 @@
-from fastapi import APIRouter
+import time
+import uuid
+
+from fastapi import APIRouter, HTTPException, Query
 
 from app.core.config import DEFAULT_COLLECTION_NAME
 from app.core.llm_client import call_llm
 from app.schemas.ask import AskRequest
+from app.services.ask_audit_service import (
+    get_ask_audit,
+    list_ask_audits,
+    safe_save_ask_audit,
+    to_json,
+)
 from app.services.query_intent_service import classify_query_intent
 from app.services.search_service import search_with_optional_rewrite
 
 
 router = APIRouter(tags=["ask"])
+
+
+def elapsed_ms(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
+
+
+def build_ask_audit_record(
+    *,
+    request_id: str,
+    req: AskRequest,
+    started_at: float,
+    status: str,
+    answer: str | None,
+    search_result: dict | None,
+    fallback_reason: str | None = None,
+    error: Exception | None = None,
+) -> dict:
+    search_result = search_result or {}
+    snippets = search_result.get("snippets", []) or []
+
+    return {
+        "request_id": request_id,
+        "status": status,
+        "question": req.question,
+        "answer": answer,
+        "top_k": req.top_k,
+        "use_rewrite": req.use_rewrite,
+        "rewritten_query": search_result.get("rewritten_query"),
+        "used_queries_json": to_json(search_result.get("used_queries", []) or []),
+        "retrieval_count": len(snippets),
+        "sources_json": to_json(search_result.get("sources", []) or []),
+        "distances_json": to_json(search_result.get("distances", []) or []),
+        "latency_ms": elapsed_ms(started_at),
+        "fallback_reason": fallback_reason,
+        "error_type": type(error).__name__ if error else None,
+        "error_message": str(error) if error else None,
+    }
 
 
 def build_answer_style_hint(query_intent: str | None) -> str:
@@ -87,21 +133,66 @@ def search(
     )
 
 
+@router.get("/ask_audit")
+def list_ask_audit_records(
+    limit: int = Query(20, ge=1, le=100),
+    status: str | None = None,
+    fallback_reason: str | None = None,
+):
+    return {
+        "items": list_ask_audits(
+            limit=limit,
+            status=status or None,
+            fallback_reason=fallback_reason or None,
+        )
+    }
+
+
+@router.get("/ask_audit/{request_id}")
+def get_ask_audit_record(request_id: str):
+    record = get_ask_audit(request_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="ask audit record not found")
+    return record
+
+
 @router.post("/ask")
 def ask(req: AskRequest):
-    query_intent = classify_query_intent(req.question)
-    search_result = search_with_optional_rewrite(
-        query_text=req.question,
-        n_results=req.top_k,
-        collection_name=DEFAULT_COLLECTION_NAME,
-        use_rewrite=req.use_rewrite,
-    )
+    request_id = str(uuid.uuid4())
+    started_at = time.perf_counter()
+    search_result = None
+
+    try:
+        query_intent = classify_query_intent(req.question)
+        search_result = search_with_optional_rewrite(
+            query_text=req.question,
+            n_results=req.top_k,
+            collection_name=DEFAULT_COLLECTION_NAME,
+            use_rewrite=req.use_rewrite,
+        )
+    except Exception as exc:
+        safe_save_ask_audit(
+            build_ask_audit_record(
+                request_id=request_id,
+                req=req,
+                started_at=started_at,
+                status="error",
+                answer=None,
+                search_result=search_result,
+                fallback_reason="search_failed",
+                error=exc,
+            )
+        )
+        raise
+
     documents = search_result["snippets"]
 
     if not documents:
-        return {
+        answer = "没有检索到相关内容，暂时无法回答。"
+        response = {
+            "request_id": request_id,
             "question": req.question,
-            "answer": "没有检索到相关内容，暂时无法回答。",
+            "answer": answer,
             "snippets": [],
             "sources": [],
             "distances": [],
@@ -109,11 +200,39 @@ def ask(req: AskRequest):
             "used_queries": search_result["used_queries"],
             "rewrite_hints": search_result["rewrite_hints"],
         }
+        safe_save_ask_audit(
+            build_ask_audit_record(
+                request_id=request_id,
+                req=req,
+                started_at=started_at,
+                status="no_retrieval",
+                answer=answer,
+                search_result=search_result,
+                fallback_reason="no_retrieval_result",
+            )
+        )
+        return response
 
     prompt = build_prompt(req.question, documents, query_intent)
-    answer = call_llm(prompt)
+    try:
+        answer = call_llm(prompt)
+    except Exception as exc:
+        safe_save_ask_audit(
+            build_ask_audit_record(
+                request_id=request_id,
+                req=req,
+                started_at=started_at,
+                status="error",
+                answer=None,
+                search_result=search_result,
+                fallback_reason="llm_failed",
+                error=exc,
+            )
+        )
+        raise
 
-    return {
+    response = {
+        "request_id": request_id,
         "question": req.question,
         "answer": answer,
         "snippets": documents,
@@ -123,3 +242,14 @@ def ask(req: AskRequest):
         "used_queries": search_result["used_queries"],
         "rewrite_hints": search_result["rewrite_hints"],
     }
+    safe_save_ask_audit(
+        build_ask_audit_record(
+            request_id=request_id,
+            req=req,
+            started_at=started_at,
+            status="success",
+            answer=answer,
+            search_result=search_result,
+        )
+    )
+    return response

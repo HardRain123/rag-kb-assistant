@@ -6,9 +6,11 @@ from app.api.ask import router as ask_router
 from app.api.health import router as health_router
 from app.api.upload import router as upload_router
 from app.core.config import APP_DESCRIPTION, APP_TITLE, APP_VERSION
+from app.services.ask_audit_service import init_ask_audit_db
 
 
 logging.basicConfig(level=logging.INFO)
+init_ask_audit_db()
 
 # main.py 现在只保留应用入口职责：
 # 1. 创建 FastAPI 应用

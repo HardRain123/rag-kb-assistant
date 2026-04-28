@@ -216,7 +216,6 @@ def search_with_optional_rewrite(
     recall_n = max(n_results, 4)
     query_intent = classify_query_intent(query_text)
 
-    //
     raw_results = query_with_intent_priority(
         collection_name=collection_name,
         query_text=query_text,
