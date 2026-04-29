@@ -1,4 +1,3 @@
-
 import logging
 import uuid
 from pathlib import Path
@@ -30,7 +29,9 @@ async def upload_file(
         raise HTTPException(status_code=400, detail="未选择文件")
 
     if not file.filename.endswith((".txt", ".docx", ".doc", ".md")):
-        logger.warning("Upload rejected because file type is not supported: %s", file.filename)
+        logger.warning(
+            "Upload rejected because file type is not supported: %s", file.filename
+        )
         raise HTTPException(
             status_code=400, detail="当前阶段只支持 txt、docx、doc 和 md 文件"
         )
@@ -41,7 +42,9 @@ async def upload_file(
 
     content = await file.read()
     if not content:
-        logger.warning("Upload rejected because file content is empty: %s", file.filename)
+        logger.warning(
+            "Upload rejected because file content is empty: %s", file.filename
+        )
         raise HTTPException(status_code=400, detail="上传文件为空")
 
     with open(save_path, "wb") as output_file:
@@ -85,7 +88,7 @@ def replace_file(req: ReplaceFileRequest):
     )
 
 
-@router.get("/remove_collection")
+@router.get("/remove_collection", include_in_schema=False)
 def remove_collection(collection_name: str):
     get_chroma_client().delete_collection(name=collection_name)
     return {"message": f"Collection '{collection_name}' 已删除"}
