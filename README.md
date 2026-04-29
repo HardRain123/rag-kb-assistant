@@ -1,5 +1,6 @@
 # 理赔知识库问答助手（RAG KB Assistant）
 
+<img src="./architecture.png" alt="架构图" width="900">
 一个面向理赔知识问答与工单辅助场景的轻量级 RAG 项目。当前版本已经覆盖：
 
 - 文档上传、切片入库、向量检索、证据驱动问答
@@ -8,6 +9,8 @@
 - `/ask` 的 SQLite 审计记录
 - 异常处理与降级
 - `citations / confidence` 结构化输出
+
+
 
 
 ## 项目定位
